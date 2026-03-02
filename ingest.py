@@ -13,6 +13,7 @@ from spacetrack import SpaceTrackClient
 from config import (
     BATCH_SIZE,
     DB_PATH,
+    MANEUVER_THRESHOLDS,
     SCHEMA_PATH,
     SPACETRACK_IDENTITY,
     SPACETRACK_PASSWORD,
@@ -220,6 +221,9 @@ def ingest_update(con, st):
         con.commit()
         log.info("Inserted %d updated GP records", len(rows))
 
+        # Run maneuver detection on the objects just updated
+        detect_maneuvers(con, norad_ids)
+
     # Update GP sync timestamp
     now = datetime.now(timezone.utc).isoformat()
     con.execute(
@@ -248,6 +252,131 @@ def ingest_update(con, st):
     log.info("Incremental update completed in %.1f s", elapsed)
 
 
+# ── Maneuver detection ─────────────────────────────────────────
+
+# Map threshold keys to the (gp column, maneuvers delta column) pairs
+_ELEMENT_MAP = [
+    ("SEMIMAJOR_AXIS", "DELTA_SMA"),
+    ("ECCENTRICITY",   "DELTA_ECCENTRICITY"),
+    ("INCLINATION",    "DELTA_INCLINATION"),
+    ("RA_OF_ASC_NODE", "DELTA_RAAN"),
+    ("PERIOD",         "DELTA_PERIOD"),
+]
+
+
+def detect_maneuvers(con, norad_ids):
+    """Compare current GP vs most recent gp_history for each object.
+
+    If any tracked orbital element delta exceeds its threshold, insert a
+    maneuver detection row.  Only examines the given *norad_ids* (i.e. the
+    objects just refreshed by --update).
+    """
+    if not norad_ids:
+        return
+
+    detected = 0
+    for nid in norad_ids:
+        # Current epoch from gp
+        cur = con.execute(
+            "SELECT EPOCH, SEMIMAJOR_AXIS, ECCENTRICITY, INCLINATION, "
+            "RA_OF_ASC_NODE, PERIOD, APOAPSIS, PERIAPSIS "
+            "FROM gp WHERE NORAD_CAT_ID = ?",
+            (nid,),
+        ).fetchone()
+        if cur is None:
+            continue
+
+        # Most recent prior epoch from gp_history
+        prev = con.execute(
+            "SELECT EPOCH, SEMIMAJOR_AXIS, ECCENTRICITY, INCLINATION, "
+            "RA_OF_ASC_NODE, PERIOD, APOAPSIS, PERIAPSIS "
+            "FROM gp_history WHERE NORAD_CAT_ID = ? ORDER BY EPOCH DESC LIMIT 1",
+            (nid,),
+        ).fetchone()
+        if prev is None:
+            continue
+
+        # Compute deltas; skip if either value is NULL
+        deltas = {}
+        exceeded = False
+        for elem, delta_col in _ELEMENT_MAP:
+            c_val = cur[elem]
+            p_val = prev[elem]
+            if c_val is None or p_val is None:
+                deltas[delta_col] = None
+                continue
+            d = abs(c_val - p_val)
+            deltas[delta_col] = d
+            threshold = MANEUVER_THRESHOLDS.get(elem)
+            if threshold is not None and d > threshold:
+                exceeded = True
+
+        if not exceeded:
+            continue
+
+        # Also record apoapsis/periapsis deltas (informational, not threshold-checked)
+        for gp_col, delta_col in [("APOAPSIS", "DELTA_APOAPSIS"), ("PERIAPSIS", "DELTA_PERIAPSIS")]:
+            c_val = cur[gp_col]
+            p_val = prev[gp_col]
+            if c_val is not None and p_val is not None:
+                deltas[delta_col] = abs(c_val - p_val)
+            else:
+                deltas[delta_col] = None
+
+        con.execute(
+            "INSERT OR IGNORE INTO maneuvers "
+            "(NORAD_CAT_ID, EPOCH_BEFORE, EPOCH_AFTER, DELTA_SMA, "
+            "DELTA_ECCENTRICITY, DELTA_INCLINATION, DELTA_RAAN, "
+            "DELTA_PERIOD, DELTA_APOAPSIS, DELTA_PERIAPSIS) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                nid,
+                prev["EPOCH"],
+                cur["EPOCH"],
+                deltas["DELTA_SMA"],
+                deltas["DELTA_ECCENTRICITY"],
+                deltas["DELTA_INCLINATION"],
+                deltas["DELTA_RAAN"],
+                deltas["DELTA_PERIOD"],
+                deltas["DELTA_APOAPSIS"],
+                deltas["DELTA_PERIAPSIS"],
+            ),
+        )
+        detected += 1
+
+    con.commit()
+    log.info("Detected %d maneuver(s) across %d candidate object(s)", detected, len(norad_ids))
+
+
+def show_maneuvers(con, limit=20):
+    """Print recent maneuver detections."""
+    rows = con.execute(
+        "SELECT m.NORAD_CAT_ID, g.OBJECT_NAME, m.EPOCH_BEFORE, m.EPOCH_AFTER, "
+        "m.DELTA_SMA, m.DELTA_PERIOD, m.DELTA_INCLINATION, m.detected_at "
+        "FROM maneuvers m "
+        "LEFT JOIN gp g ON m.NORAD_CAT_ID = g.NORAD_CAT_ID "
+        "ORDER BY m.EPOCH_AFTER DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+    total = con.execute("SELECT COUNT(*) FROM maneuvers").fetchone()[0]
+    print(f"\n{'='*70}")
+    print(f"  Maneuver Detections  (showing {len(rows)} of {total})")
+    print(f"{'='*70}")
+    if not rows:
+        print("  No maneuvers detected yet.")
+    else:
+        print(f"  {'NORAD':>7}  {'Name':<24} {'Epoch After':<22} {'dSMA km':>8} {'dPer min':>8} {'dInc deg':>8}")
+        print(f"  {'-'*7}  {'-'*24} {'-'*22} {'-'*8} {'-'*8} {'-'*8}")
+        for r in rows:
+            name = (r["OBJECT_NAME"] or "")[:24]
+            dsma = f"{r['DELTA_SMA']:.2f}" if r["DELTA_SMA"] is not None else "N/A"
+            dper = f"{r['DELTA_PERIOD']:.3f}" if r["DELTA_PERIOD"] is not None else "N/A"
+            dinc = f"{r['DELTA_INCLINATION']:.4f}" if r["DELTA_INCLINATION"] is not None else "N/A"
+            print(f"  {r['NORAD_CAT_ID']:>7}  {name:<24} {r['EPOCH_AFTER']:<22} {dsma:>8} {dper:>8} {dinc:>8}")
+    print(f"{'='*70}\n")
+
+
 # ── Status ──────────────────────────────────────────────────────
 
 def show_status(con):
@@ -255,6 +384,7 @@ def show_status(con):
     gp_count = con.execute("SELECT COUNT(*) FROM gp").fetchone()[0]
     hist_count = con.execute("SELECT COUNT(*) FROM gp_history").fetchone()[0]
     sat_count = con.execute("SELECT COUNT(*) FROM satcat").fetchone()[0]
+    mnv_count = con.execute("SELECT COUNT(*) FROM maneuvers").fetchone()[0]
 
     print(f"\n{'='*50}")
     print(f"  Satellite Catalog Database Status")
@@ -262,6 +392,7 @@ def show_status(con):
     print(f"  GP records (latest):    {gp_count:>8,}")
     print(f"  GP history records:     {hist_count:>8,}")
     print(f"  SATCAT records:         {sat_count:>8,}")
+    print(f"  Maneuver detections:    {mnv_count:>8,}")
 
     # Sync times
     for key_label in [("last_gp_sync", "Last GP sync"), ("last_satcat_sync", "Last SATCAT sync")]:
@@ -303,12 +434,18 @@ def main():
     group.add_argument("--full", action="store_true", help="Full initial load")
     group.add_argument("--update", action="store_true", help="Incremental update since last sync")
     group.add_argument("--status", action="store_true", help="Show DB stats")
+    group.add_argument("--maneuvers", action="store_true", help="Show recent maneuver detections")
     args = parser.parse_args()
 
     con = init_db()
 
     if args.status:
         show_status(con)
+        con.close()
+        return
+
+    if args.maneuvers:
+        show_maneuvers(con)
         con.close()
         return
 

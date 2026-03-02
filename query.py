@@ -78,6 +78,71 @@ def get_catalog_stats() -> dict:
     return stats
 
 
+def get_maneuvers(
+    norad_id: Optional[int] = None,
+    since: Optional[str] = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Return maneuver detections, optionally filtered by object or time.
+
+    Args:
+        norad_id: Filter to a single NORAD_CAT_ID.
+        since: ISO 8601 timestamp — only return detections with EPOCH_AFTER > since.
+        limit: Max rows to return.
+    """
+    con = _connect()
+    clauses = []
+    params: list = []
+    if norad_id is not None:
+        clauses.append("m.NORAD_CAT_ID = ?")
+        params.append(norad_id)
+    if since is not None:
+        clauses.append("m.EPOCH_AFTER > ?")
+        params.append(since)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
+    rows = con.execute(
+        f"SELECT m.*, g.OBJECT_NAME FROM maneuvers m "
+        f"LEFT JOIN gp g ON m.NORAD_CAT_ID = g.NORAD_CAT_ID "
+        f"{where} ORDER BY m.EPOCH_AFTER DESC LIMIT ?",
+        params,
+    ).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def get_maneuvering_objects(since: Optional[str] = None) -> list[int]:
+    """Return distinct NORAD_CAT_IDs that have maneuver detections.
+
+    Args:
+        since: ISO 8601 timestamp — only consider detections with EPOCH_AFTER > since.
+    """
+    con = _connect()
+    if since is not None:
+        rows = con.execute(
+            "SELECT DISTINCT NORAD_CAT_ID FROM maneuvers "
+            "WHERE EPOCH_AFTER > ? ORDER BY NORAD_CAT_ID",
+            (since,),
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT DISTINCT NORAD_CAT_ID FROM maneuvers ORDER BY NORAD_CAT_ID"
+        ).fetchall()
+    con.close()
+    return [r[0] for r in rows]
+
+
+def get_maneuver_history(norad_id: int) -> list[dict]:
+    """Return the full maneuver timeline for a single object, oldest first."""
+    con = _connect()
+    rows = con.execute(
+        "SELECT * FROM maneuvers WHERE NORAD_CAT_ID = ? ORDER BY EPOCH_AFTER ASC",
+        (norad_id,),
+    ).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
 def get_tle(norad_id: int) -> tuple[str, str, str] | None:
     """Return (line0, line1, line2) TLE strings ready for SGP4 propagation."""
     con = _connect()

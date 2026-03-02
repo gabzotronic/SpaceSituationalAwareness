@@ -112,6 +112,23 @@ CREATE TABLE IF NOT EXISTS sync_meta (
     value   TEXT NOT NULL
 );
 
+-- Detected maneuvers (derived from consecutive GP epoch comparisons)
+CREATE TABLE IF NOT EXISTS maneuvers (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    NORAD_CAT_ID        INTEGER NOT NULL,
+    EPOCH_BEFORE        TEXT NOT NULL,
+    EPOCH_AFTER         TEXT NOT NULL,
+    DELTA_SMA           REAL,    -- km
+    DELTA_ECCENTRICITY  REAL,
+    DELTA_INCLINATION   REAL,    -- degrees
+    DELTA_RAAN          REAL,    -- degrees
+    DELTA_PERIOD        REAL,    -- minutes
+    DELTA_APOAPSIS      REAL,    -- km
+    DELTA_PERIAPSIS     REAL,    -- km
+    detected_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(NORAD_CAT_ID, EPOCH_BEFORE, EPOCH_AFTER)
+);
+
 -- Indexes for conjunction prediction queries
 CREATE INDEX IF NOT EXISTS idx_gp_norad       ON gp (NORAD_CAT_ID);
 CREATE INDEX IF NOT EXISTS idx_gp_epoch       ON gp (EPOCH);
@@ -122,6 +139,9 @@ CREATE INDEX IF NOT EXISTS idx_gp_hist_epoch  ON gp_history (EPOCH);
 CREATE INDEX IF NOT EXISTS idx_satcat_type    ON satcat (OBJECT_TYPE);
 CREATE INDEX IF NOT EXISTS idx_satcat_country ON satcat (COUNTRY);
 CREATE INDEX IF NOT EXISTS idx_satcat_current ON satcat (CURRENT);
+
+CREATE INDEX IF NOT EXISTS idx_maneuvers_norad ON maneuvers (NORAD_CAT_ID);
+CREATE INDEX IF NOT EXISTS idx_maneuvers_epoch ON maneuvers (EPOCH_AFTER);
 
 -- Convenience view joining GP and SATCAT
 CREATE VIEW IF NOT EXISTS catalog_view AS

@@ -16,3 +16,12 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 # Ingestion settings
 BATCH_SIZE = 5000  # rows per executemany batch
+
+# Maneuver detection thresholds (absolute deltas between consecutive GP epochs)
+MANEUVER_THRESHOLDS = {
+    "SEMIMAJOR_AXIS": 1.0,    # km
+    "ECCENTRICITY":   0.001,
+    "INCLINATION":    0.05,   # degrees
+    "RA_OF_ASC_NODE": 0.5,    # degrees
+    "PERIOD":         0.05,   # minutes
+}
