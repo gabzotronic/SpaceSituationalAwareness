@@ -1,0 +1,3 @@
+spacetrack>=1.3.0
+python-dotenv>=1.0.0
+sgp4>=2.22
