@@ -9,6 +9,7 @@ Local SQLite database of the US Space Command satellite catalog, ingested from [
 | `gp` | ~33K | Latest GP element set per object (Keplerian elements, TLE lines, drag term, derived orbital params). One row per tracked object currently on orbit. |
 | `gp_history` | grows over time | Previous GP records archived when a newer epoch arrives during incremental updates. |
 | `satcat` | ~68K | Full satellite catalog — every object ever tracked, including decayed. Contains launch info, country, object type, RCS size. |
+| `maneuvers` | grows over time | Detected orbital maneuvers — epoch pairs with element deltas that exceeded configurable thresholds. |
 | `sync_meta` | 2 rows | Timestamps of last GP and SATCAT sync. |
 | `catalog_view` | (view) | Convenience join of `gp` + `satcat` on `NORAD_CAT_ID`. |
 
@@ -29,8 +30,9 @@ SPACETRACK_PASSWORD=yourpassword
 
 ```bash
 python ingest.py --full      # Initial load (~18s, fetches full GP + SATCAT)
-python ingest.py --update    # Incremental update (new epochs since last sync)
+python ingest.py --update    # Incremental update (new epochs since last sync + maneuver detection)
 python ingest.py --status    # Show record counts and sync timestamps
+python ingest.py --maneuvers # Show recent maneuver detections
 ```
 
 ## Querying
@@ -38,7 +40,10 @@ python ingest.py --status    # Show record counts and sync timestamps
 ### Python helpers (`query.py`)
 
 ```python
-from query import get_object, get_tle, get_objects_in_altitude_band, get_catalog_stats
+from query import (
+    get_object, get_tle, get_objects_in_altitude_band, get_catalog_stats,
+    get_maneuvers, get_maneuvering_objects, get_maneuver_history,
+)
 
 # Look up a single object by NORAD ID
 iss = get_object(25544)
@@ -55,6 +60,11 @@ debris = get_objects_by_type("DEBRIS")
 
 # Database summary
 stats = get_catalog_stats()
+
+# Maneuver detection — objects with orbital element jumps between GP epochs
+recent = get_maneuvers(since="2026-03-01")           # all recent detections
+iss_maneuvers = get_maneuver_history(25544)           # full timeline for one object
+active_ids = get_maneuvering_objects(since="2026-03-01")  # NORAD IDs that maneuvered
 ```
 
 ### Direct SQL (`satcat.db`)
@@ -104,6 +114,26 @@ WHERE s.CURRENT = 'Y'
 GROUP BY s.COUNTRY
 ORDER BY cnt DESC
 LIMIT 10;
+```
+
+**Recent maneuver detections** (objects whose orbital elements jumped between consecutive GP epochs):
+
+```sql
+SELECT m.NORAD_CAT_ID, g.OBJECT_NAME, m.EPOCH_AFTER,
+       m.DELTA_SMA, m.DELTA_PERIOD, m.DELTA_INCLINATION
+FROM maneuvers m
+LEFT JOIN gp g ON m.NORAD_CAT_ID = g.NORAD_CAT_ID
+ORDER BY m.EPOCH_AFTER DESC
+LIMIT 20;
+```
+
+**Maneuver history for a specific object:**
+
+```sql
+SELECT EPOCH_BEFORE, EPOCH_AFTER, DELTA_SMA, DELTA_PERIOD, DELTA_INCLINATION
+FROM maneuvers
+WHERE NORAD_CAT_ID = 25544
+ORDER BY EPOCH_AFTER;
 ```
 
 **Track orbital element history** (after running `--update` at least once):
@@ -163,12 +193,32 @@ WHERE NORAD_CAT_ID = 25544;
 | `RCS_SIZE` | TEXT | Radar cross-section category (SMALL, MEDIUM, LARGE) |
 | `CURRENT` | TEXT | "Y" if currently tracked, "N" if historical |
 
+### `maneuvers` table — key columns
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `NORAD_CAT_ID` | INTEGER | Object that maneuvered |
+| `EPOCH_BEFORE` | TEXT | GP epoch of the prior element set |
+| `EPOCH_AFTER` | TEXT | GP epoch of the new element set |
+| `DELTA_SMA` | REAL | Absolute change in semi-major axis (km) |
+| `DELTA_ECCENTRICITY` | REAL | Absolute change in eccentricity |
+| `DELTA_INCLINATION` | REAL | Absolute change in inclination (degrees) |
+| `DELTA_RAAN` | REAL | Absolute change in RAAN (degrees) |
+| `DELTA_PERIOD` | REAL | Absolute change in period (minutes) |
+| `DELTA_APOAPSIS` | REAL | Absolute change in apogee altitude (km) |
+| `DELTA_PERIAPSIS` | REAL | Absolute change in perigee altitude (km) |
+| `detected_at` | TEXT | When the detection was recorded |
+
+Thresholds for triggering a detection are configured in `config.py` (`MANEUVER_THRESHOLDS`). A row is inserted when **any** tracked element exceeds its threshold. Detection runs automatically after each `--update` cycle.
+
 ### Indexes
 
 Optimized for conjunction prediction workflows:
 - `gp(NORAD_CAT_ID)` — fast single-object lookup
 - `gp(EPOCH)` — filtering by data freshness
 - `gp(APOAPSIS, PERIAPSIS)` — altitude-band screening
+- `maneuvers(NORAD_CAT_ID)` — maneuver lookup by object
+- `maneuvers(EPOCH_AFTER)` — recent maneuver queries
 - `satcat(OBJECT_TYPE)`, `satcat(COUNTRY)`, `satcat(CURRENT)` — catalog filtering
 
 ## Data source

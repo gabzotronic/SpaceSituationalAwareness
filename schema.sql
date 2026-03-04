@@ -129,6 +129,30 @@ CREATE TABLE IF NOT EXISTS maneuvers (
     UNIQUE(NORAD_CAT_ID, EPOCH_BEFORE, EPOCH_AFTER)
 );
 
+-- Ground-based SSA sensor network
+CREATE TABLE IF NOT EXISTS sensor (
+    SENSOR_ID       INTEGER PRIMARY KEY AUTOINCREMENT,
+    NAME            TEXT NOT NULL,
+    COUNTRY         TEXT,
+    ORGANISATION    TEXT,
+    ORG_TYPE        TEXT,           -- Civil, Military, Research
+    TYPE            TEXT NOT NULL,  -- OPTICAL, RADAR, PHASED_ARRAY_RADAR, LASER
+    LAT             REAL NOT NULL,  -- degrees
+    LON             REAL NOT NULL,  -- degrees
+    ALT_M           REAL NOT NULL DEFAULT 0,  -- metres above WGS84 ellipsoid
+    MIN_EL_DEG      REAL NOT NULL DEFAULT 10, -- minimum elevation (horizon mask)
+    MAX_EL_DEG      REAL NOT NULL DEFAULT 90,
+    AZ_MIN_DEG      REAL DEFAULT -180,
+    AZ_MAX_DEG      REAL DEFAULT 180,
+    ORIENTATION_DEG REAL DEFAULT 0,
+    MIN_RANGE_KM    REAL NOT NULL DEFAULT 200,
+    MAX_RANGE_KM    REAL NOT NULL,            -- sensor-dependent detection limit
+    SENSITIVITY     REAL,          -- min RCS (m²) for radar; limiting mag for optical/laser
+    REMARKS         TEXT,
+    ingested_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(NAME, LAT, LON)
+);
+
 -- Indexes for conjunction prediction queries
 CREATE INDEX IF NOT EXISTS idx_gp_norad       ON gp (NORAD_CAT_ID);
 CREATE INDEX IF NOT EXISTS idx_gp_epoch       ON gp (EPOCH);
@@ -139,6 +163,9 @@ CREATE INDEX IF NOT EXISTS idx_gp_hist_epoch  ON gp_history (EPOCH);
 CREATE INDEX IF NOT EXISTS idx_satcat_type    ON satcat (OBJECT_TYPE);
 CREATE INDEX IF NOT EXISTS idx_satcat_country ON satcat (COUNTRY);
 CREATE INDEX IF NOT EXISTS idx_satcat_current ON satcat (CURRENT);
+
+CREATE INDEX IF NOT EXISTS idx_sensor_type    ON sensor (TYPE);
+CREATE INDEX IF NOT EXISTS idx_sensor_country ON sensor (COUNTRY);
 
 CREATE INDEX IF NOT EXISTS idx_maneuvers_norad ON maneuvers (NORAD_CAT_ID);
 CREATE INDEX IF NOT EXISTS idx_maneuvers_epoch ON maneuvers (EPOCH_AFTER);
