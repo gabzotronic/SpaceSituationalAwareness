@@ -377,6 +377,48 @@ def show_maneuvers(con, limit=20):
     print(f"{'='*70}\n")
 
 
+# ── Historical backfill ─────────────────────────────────────────
+
+def backfill_gp_history(con, st, norad_id: int, start: str, end: str):
+    """Fetch gp_history from Space-Track for one object over a date range
+    and insert into the local gp_history table.
+
+    Args:
+        norad_id: NORAD_CAT_ID to backfill.
+        start:    Start date string 'YYYY-MM-DD' (inclusive).
+        end:      End date string 'YYYY-MM-DD' (inclusive).
+    """
+    log.info(
+        "Fetching gp_history for NORAD %d from %s to %s ...", norad_id, start, end
+    )
+    raw = st.gp_history(
+        norad_cat_id=norad_id,
+        epoch=op.inclusive_range(start, end),
+        orderby="epoch asc",
+        format="json",
+    )
+    records = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    log.info("Received %d records from Space-Track", len(records))
+
+    if not records:
+        log.warning("No records returned — check NORAD ID and date range.")
+        return
+
+    rows = [_build_gp_row(r) for r in records]
+    sql = (
+        f"INSERT OR IGNORE INTO gp_history ({_gp_col_names()}) "
+        f"VALUES ({_gp_placeholders()})"
+    )
+    inserted = 0
+    for i in range(0, len(rows), BATCH_SIZE):
+        batch = rows[i : i + BATCH_SIZE]
+        con.executemany(sql, batch)
+        inserted += con.execute("SELECT changes()").fetchone()[0]
+    con.commit()
+    log.info("Inserted %d new records into gp_history (%d duplicates skipped)",
+             inserted, len(rows) - inserted)
+
+
 # ── Status ──────────────────────────────────────────────────────
 
 def show_status(con):
@@ -433,8 +475,16 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--full", action="store_true", help="Full initial load")
     group.add_argument("--update", action="store_true", help="Incremental update since last sync")
+    group.add_argument("--backfill", action="store_true",
+                       help="Backfill gp_history for one object over a date range")
     group.add_argument("--status", action="store_true", help="Show DB stats")
     group.add_argument("--maneuvers", action="store_true", help="Show recent maneuver detections")
+    parser.add_argument("--norad", type=int,
+                        help="NORAD_CAT_ID to backfill (required with --backfill)")
+    parser.add_argument("--start", default="2025-12-18",
+                        help="Start date for --backfill (YYYY-MM-DD, default: 2025-12-18)")
+    parser.add_argument("--end", default="2026-03-10",
+                        help="End date for --backfill (YYYY-MM-DD, default: 2026-03-10)")
     args = parser.parse_args()
 
     con = init_db()
@@ -456,6 +506,10 @@ def main():
         ingest_full(con, st)
     elif args.update:
         ingest_update(con, st)
+    elif args.backfill:
+        if not args.norad:
+            parser.error("--backfill requires --norad NORAD_ID")
+        backfill_gp_history(con, st, args.norad, args.start, args.end)
 
     show_status(con)
     con.close()
