@@ -496,7 +496,8 @@ def plot_maneuvers(
     out = plot_dir / f"maneuver_detection_{norad_id}.png"
     fig.savefig(str(out), dpi=150, bbox_inches="tight")
     print(f"Plot saved to {out}")
-    plt.close(fig)
+    plt.show()
+    # plt.close(fig)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
