@@ -125,9 +125,17 @@ CREATE TABLE IF NOT EXISTS maneuvers (
     DELTA_PERIOD        REAL,    -- minutes
     DELTA_APOAPSIS      REAL,    -- km
     DELTA_PERIAPSIS     REAL,    -- km
+    CLASSIFICATION      TEXT,    -- 'confirmed' | 'uncertain'
+    KP                  REAL,
+    VEL_RESIDUAL_MS     REAL,
+    BSTAR_DELTA         REAL,
     detected_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE(NORAD_CAT_ID, EPOCH_BEFORE, EPOCH_AFTER)
 );
+
+-- Idempotent migration: add OD columns to existing maneuvers tables
+-- (safe to re-run; errors from duplicate columns are ignored in Python)
+-- Migration is handled via try/except in ingest.py init_db().
 
 -- Ground-based SSA sensor network
 CREATE TABLE IF NOT EXISTS sensor (

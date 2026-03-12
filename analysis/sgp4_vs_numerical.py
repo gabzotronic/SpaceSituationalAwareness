@@ -40,7 +40,7 @@ from org.orekit.forces.gravity import (
 )
 from org.orekit.forces.gravity.potential import GravityFieldFactory
 from org.orekit.forces.drag import DragForce, IsotropicDrag
-from org.orekit.models.earth.atmosphere import HarrisPriester
+from org.orekit.models.earth.atmosphere import NRLMSISE00
 from org.orekit.bodies import CelestialBodyFactory, OneAxisEllipsoid
 from org.orekit.frames import FramesFactory, Transform
 from org.orekit.time import AbsoluteDate, TimeScalesFactory
@@ -52,10 +52,15 @@ from org.hipparchus.ode.nonstiff import DormandPrince853Integrator
 import argparse
 import json
 import sys
+import urllib.request
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from jpype import JImplements, JOverride
+from jpype.types import JArray, JDouble
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -75,8 +80,8 @@ EARTH_MU = Constants.WGS84_EARTH_MU
 EARTH_RE_M = Constants.WGS84_EARTH_EQUATORIAL_RADIUS
 
 # Sentinel-1A physical parameters (ESA documentation)
-SENTINEL_1A_MASS_KG = 2300.0
-SENTINEL_1A_AREA_M2 = 25.0     # approximate cross-section (large SAR antenna)
+SENTINEL_1A_MASS_KG = 2200.0
+SENTINEL_1A_AREA_M2 = 4.42     # approximate cross-section (large SAR antenna)
 SENTINEL_1A_CD = 2.2
 
 
@@ -169,13 +174,199 @@ def fetch_tles(
 
 
 def pick_best_tle(
-    tles: List[Tuple[datetime, str, str]], target_dt: datetime,
+    tles: List[Tuple[datetime, str, str]],
+    poe_start: datetime,
+    poe_end: datetime,
 ) -> Tuple[datetime, str, str]:
-    """Pick the TLE with epoch closest to (and preferably just before) target_dt."""
-    before = [(ep, l1, l2) for ep, l1, l2 in tles if ep <= target_dt]
-    if before:
-        return max(before, key=lambda t: t[0])
-    return min(tles, key=lambda t: abs((t[0] - target_dt).total_seconds()))
+    """
+    Pick the TLE that gives the fairest comparison:
+      1. Prefer TLEs whose epoch falls inside [poe_start, poe_end] -- TLE age
+         at the IC is 0, so SGP4 is as fresh as it can be.
+      2. Among those, pick the *earliest* to maximise the remaining POE window
+         available for comparison (sacrificing as few POE datapoints as possible).
+      3. If no TLE falls inside the POE window, fall back to the TLE whose epoch
+         is closest to poe_start.
+    """
+    inside = [(ep, l1, l2) for ep, l1, l2 in tles if poe_start <= ep <= poe_end]
+    if inside:
+        return min(inside, key=lambda t: t[0])   # earliest inside window
+    return min(tles, key=lambda t: abs((t[0] - poe_start).total_seconds()))
+
+
+# ── Space weather (NRLMSISE-00) ──────────────────────────────────────────────
+
+_GFZ_DAILY_URL = "https://kp.gfz-potsdam.de/app/files/Kp_ap_Ap_SN_F107_since_1932.txt"
+
+
+@dataclass
+class _DaySW:
+    """One day of space weather parsed from the GFZ daily file."""
+    f107obs: float               # observed F10.7 (sfu)
+    f107_81: float = 0.0         # 81-day centred mean (computed after loading)
+    ap8: List[float] = field(default_factory=list)  # 8 three-hourly ap values
+    ap_daily: float = 9.0        # daily Ap
+
+
+def _parse_sw_daily(text: str) -> Dict[datetime, _DaySW]:
+    """Parse GFZ daily file → {UTC date (midnight): _DaySW}."""
+    sw: Dict[datetime, _DaySW] = {}
+    for line in text.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) < 27:
+            continue
+        try:
+            year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+            ap8 = [float(parts[15 + i]) for i in range(8)]
+            ap_daily = float(parts[23])
+            f107 = float(parts[25])   # F10.7obs at col 25 (no Cp/C9 in this file)
+            if f107 <= 0:
+                continue          # skip missing/provisional
+            date = datetime(year, month, day, tzinfo=timezone.utc)
+            sw[date] = _DaySW(f107obs=f107, ap8=ap8, ap_daily=ap_daily)
+        except (ValueError, IndexError):
+            continue
+
+    # Compute 81-day centred running mean of F10.7obs
+    dates = sorted(sw.keys())
+    for d in dates:
+        window = [sw[dd].f107obs for dd in dates if abs((dd - d).days) <= 40]
+        sw[d].f107_81 = sum(window) / len(window)
+    return sw
+
+
+def fetch_space_weather(data_dir: Path) -> Dict[datetime, _DaySW]:
+    """
+    Return a dict of daily space weather from GFZ Potsdam.
+    Caches to data_dir/sw_daily.txt; refreshes if > 3 days old.
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+    cache = data_dir / "sw_daily.txt"
+
+    needs_download = True
+    if cache.exists():
+        age_days = (datetime.utcnow() - datetime.utcfromtimestamp(cache.stat().st_mtime)).days
+        if age_days <= 3:
+            needs_download = False
+            print(f"  Using cached space weather ({age_days}d old): {cache.name}")
+
+    if needs_download:
+        print(f"  Downloading space weather from GFZ Potsdam ...")
+        req = urllib.request.Request(
+            _GFZ_DAILY_URL, headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode("utf-8")
+        cache.write_text(raw, encoding="utf-8")
+        print(f"  Saved {cache}")
+    else:
+        raw = cache.read_text(encoding="utf-8")
+
+    sw = _parse_sw_daily(raw)
+    print(f"  Space weather loaded: {len(sw)} days  "
+          f"({min(sw).date()} → {max(sw).date()})")
+    return sw
+
+
+def _sw_ap_at(sw: Dict[datetime, _DaySW], dt: datetime) -> float:
+    """3-hourly ap at a given UTC datetime."""
+    day = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+    rec = sw.get(day)
+    if rec and rec.ap8:
+        return rec.ap8[min(dt.hour // 3, 7)]
+    return 9.0
+
+
+def _sw_f107_at(sw: Dict[datetime, _DaySW], dt: datetime, prev: bool = False) -> float:
+    if prev:
+        dt = dt - timedelta(days=1)
+    day = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+    rec = sw.get(day)
+    if rec:
+        return rec.f107obs
+    # nearest fallback
+    nearest = min(sw, key=lambda d: abs((d - day).total_seconds()))
+    return sw[nearest].f107obs
+
+
+def _sw_f107_mean_at(sw: Dict[datetime, _DaySW], dt: datetime) -> float:
+    day = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+    rec = sw.get(day)
+    if rec:
+        return rec.f107_81
+    nearest = min(sw, key=lambda d: abs((d - day).total_seconds()))
+    return sw[nearest].f107_81
+
+
+def _absolute_to_datetime(date: AbsoluteDate) -> datetime:
+    utc_ts = TimeScalesFactory.getUTC()
+    comp = date.getComponents(utc_ts)
+    cal = comp.getDate()
+    t = comp.getTime()
+    return datetime(
+        cal.getYear(), cal.getMonth(), cal.getDay(),
+        t.getHour(), t.getMinute(), 0, tzinfo=timezone.utc,
+    ) + timedelta(seconds=float(t.getSecond()))
+
+
+def make_nrlmsise_inputs(
+    sw: Dict[datetime, _DaySW],
+    min_date: AbsoluteDate,
+    max_date: AbsoluteDate,
+):
+    """
+    Return a JPype implementation of NRLMSISE00InputParameters backed by
+    real GFZ Potsdam space weather data.
+
+    Ap array convention (Orekit):
+        [0] daily Ap
+        [1] 3-hr ap at current time
+        [2] 3-hr ap 3 h before
+        [3] 3-hr ap 6 h before
+        [4] 3-hr ap 9 h before
+        [5] mean of 3-hr ap 12-33 h before (8 values)
+        [6] mean of 3-hr ap 36-57 h before (8 values)
+    """
+
+    @JImplements("org.orekit.models.earth.atmosphere.NRLMSISE00InputParameters")
+    class _Inputs:
+        @JOverride
+        def getMinDate(self):
+            return min_date
+
+        @JOverride
+        def getMaxDate(self):
+            return max_date
+
+        @JOverride
+        def getDailyFlux(self, date):
+            return float(_sw_f107_at(sw, _absolute_to_datetime(date), prev=True))
+
+        @JOverride
+        def getAverageFlux(self, date):
+            return float(_sw_f107_mean_at(sw, _absolute_to_datetime(date)))
+
+        @JOverride
+        def getAp(self, date):
+            dt = _absolute_to_datetime(date)
+            day = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+            ap_daily = sw[day].ap_daily if day in sw else 9.0
+            ap_now   = _sw_ap_at(sw, dt)
+            ap_m3    = _sw_ap_at(sw, dt - timedelta(hours=3))
+            ap_m6    = _sw_ap_at(sw, dt - timedelta(hours=6))
+            ap_m9    = _sw_ap_at(sw, dt - timedelta(hours=9))
+            ap_m12_33 = sum(
+                _sw_ap_at(sw, dt - timedelta(hours=h)) for h in range(12, 36, 3)
+            ) / 8.0
+            ap_m36_57 = sum(
+                _sw_ap_at(sw, dt - timedelta(hours=h)) for h in range(36, 60, 3)
+            ) / 8.0
+            return JArray(JDouble)(
+                [ap_daily, ap_now, ap_m3, ap_m6, ap_m9, ap_m12_33, ap_m36_57]
+            )
+
+    return _Inputs()
 
 
 # ── Orekit helpers ───────────────────────────────────────────────────────────
@@ -227,12 +418,13 @@ def _make_initial_state_from_poe(
 
 def _build_numerical_propagator(
     initial_state: SpacecraftState,
+    sw_inputs,
     cross_section: float = SENTINEL_1A_AREA_M2,
     cd: float = SENTINEL_1A_CD,
 ) -> NumericalPropagator:
     """
     High-fidelity NumericalPropagator:
-      - 70x70 gravity, Harris-Priester drag, Sun+Moon, relativity
+      - 70x70 gravity, NRLMSISE-00 drag (real F10.7 + Kp), Sun+Moon, relativity
     """
     integrator = DormandPrince853Integrator(0.001, 60.0, 1.0, 1e-6)
     prop = NumericalPropagator(integrator)
@@ -246,12 +438,12 @@ def _build_numerical_propagator(
         HolmesFeatherstoneAttractionModel(itrf, gravity_field)
     )
 
-    # Atmospheric drag
+    # Atmospheric drag — NRLMSISE-00 with real space weather
     sun = CelestialBodyFactory.getSun()
     earth = OneAxisEllipsoid(
         EARTH_RE_M, Constants.WGS84_EARTH_FLATTENING, itrf,
     )
-    atmosphere = HarrisPriester(sun, earth)
+    atmosphere = NRLMSISE00(sw_inputs, sun, earth)
     prop.addForceModel(DragForce(atmosphere, IsotropicDrag(cross_section, cd)))
 
     # Third-body: Sun + Moon
@@ -291,42 +483,76 @@ def compare_propagators(
     tle_line1: str,
     tle_line2: str,
     tle_epoch: datetime,
+    sw: Dict,
     max_hours: float = 24.0,
     step_s: float = 60.0,
 ) -> Dict:
     """
     Compare SGP4 and numerical propagation against POE truth.
 
-    - Numerical propagator: initialised from first POE state (true osculating)
-    - SGP4 propagator: initialised from closest TLE (mean elements)
-    - Both compared against POE states in ITRF at each timestep
+    Fair comparison: both propagators start from the same epoch.
+    - If TLE epoch falls within the POE window, use it as the common IC epoch.
+      Numerical IC = interpolated POE state at TLE epoch; SGP4 IC = TLE mean elements.
+    - Otherwise fall back to POE start as the common IC epoch.
+    - Both compared against POE states in ITRF at each timestep.
     """
     itrf = FramesFactory.getITRF(IERSConventions.IERS_2010, True)
 
-    # ── POE initial state -> Numerical propagator ─────────────────────────
     poe_start = poe_data["utc"][0]
     poe_end = poe_data["utc"][-1]
-    epoch_ad = _datetime_to_absolute(poe_start)
 
-    print(f"  Numerical IC: POE state at {poe_start.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    init_state = _make_initial_state_from_poe(
-        poe_data["pos"][0], poe_data["vel"][0], epoch_ad,
+    # Pre-compute POE timestamps for interpolation
+    poe_ts = np.array([dt.timestamp() for dt in poe_data["utc"]])
+
+    def _interp_poe(dt: datetime):
+        """Interpolate POE pos/vel at an arbitrary datetime within the POE window."""
+        ts = dt.timestamp()
+        idx = np.searchsorted(poe_ts, ts) - 1
+        idx = max(0, min(idx, len(poe_ts) - 2))
+        frac = (ts - poe_ts[idx]) / (poe_ts[idx + 1] - poe_ts[idx])
+        pos = (1 - frac) * poe_data["pos"][idx] + frac * poe_data["pos"][idx + 1]
+        vel = (1 - frac) * poe_data["vel"][idx] + frac * poe_data["vel"][idx + 1]
+        return pos, vel
+
+    # ── Common IC epoch (fair comparison) ────────────────────────────────
+    # When the TLE epoch falls within the POE window, initialise both
+    # propagators from that same epoch so neither has an advantage from a
+    # head-start / stale IC.  If the TLE is outside the POE window we fall
+    # back to POE start for the numerical IC (current behaviour).
+    if poe_start <= tle_epoch <= poe_end:
+        common_start = tle_epoch
+        ic_note = f"TLE epoch (within POE window, Δ = 0 h)"
+    else:
+        common_start = poe_start
+        ic_note = f"POE start (TLE epoch outside POE window)"
+
+    epoch_ad = _datetime_to_absolute(common_start)
+    ic_pos, ic_vel = _interp_poe(common_start)
+
+    # ── Numerical propagator initialised from POE state at common_start ──
+    print(f"  Common IC epoch: {common_start.strftime('%Y-%m-%d %H:%M:%S UTC')}  ({ic_note})")
+    print(f"  Numerical IC: interpolated POE state at common IC epoch")
+    init_state = _make_initial_state_from_poe(ic_pos, ic_vel, epoch_ad)
+
+    # Build NRLMSISE-00 inputs valid over the full propagation window
+    prop_end_est = common_start + timedelta(hours=max_hours + 4)
+    sw_inputs = make_nrlmsise_inputs(
+        sw,
+        _datetime_to_absolute(common_start - timedelta(days=4)),
+        _datetime_to_absolute(prop_end_est),
     )
-    num_prop = _build_numerical_propagator(init_state)
+    num_prop = _build_numerical_propagator(init_state, sw_inputs)
 
     # ── TLE -> SGP4 propagator ────────────────────────────────────────────
     tle = TLE(tle_line1, tle_line2)
     sgp4_prop = TLEPropagator.selectExtrapolator(tle)
-    tle_age_h = abs((poe_start - tle_epoch).total_seconds()) / 3600.0
+    tle_age_h = (common_start - tle_epoch).total_seconds() / 3600.0
     print(f"  SGP4 IC:      TLE epoch {tle_epoch.strftime('%Y-%m-%d %H:%M:%S UTC')}"
-          f"  (age: {tle_age_h:.1f} h)")
+          f"  (age at common IC: {tle_age_h:+.1f} h)")
 
     # ── Propagation window ───────────────────────────────────────────────
-    prop_end = min(poe_start + timedelta(hours=max_hours), poe_end)
-    duration_s = (prop_end - poe_start).total_seconds()
-
-    # Pre-compute POE timestamps for interpolation
-    poe_ts = np.array([dt.timestamp() for dt in poe_data["utc"]])
+    prop_end = min(common_start + timedelta(hours=max_hours), poe_end)
+    duration_s = (prop_end - common_start).total_seconds()
 
     n_steps = int(duration_s / step_s) + 1
     elapsed_h = np.zeros(n_steps)
@@ -339,7 +565,7 @@ def compare_propagators(
 
     for i in range(n_steps):
         t = min(i * step_s, duration_s)
-        current_dt = poe_start + timedelta(seconds=t)
+        current_dt = common_start + timedelta(seconds=t)
         elapsed_h[i] = t / 3600.0
         target_ad = _datetime_to_absolute(current_dt)
 
@@ -380,6 +606,7 @@ def compare_propagators(
 
     return {
         "poe_start": poe_start,
+        "common_start": common_start,
         "poe_end": prop_end,
         "tle_epoch": tle_epoch,
         "tle_age_h": tle_age_h,
@@ -428,7 +655,7 @@ def plot_rtn_vs_truth(result: Dict, plot_dir: Path) -> None:
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=9, loc="upper left")
 
-    ax2.set_xlabel("Elapsed time from POE start (hours)")
+    ax2.set_xlabel("Elapsed time from common IC epoch (hours)")
 
     fig.tight_layout()
     out = plot_dir / "sgp4_vs_numerical_rtn.png"
@@ -457,7 +684,7 @@ def plot_3d_error(result: Dict, plot_dir: Path) -> None:
 
     ax2.plot(hours, result["diverge_3d_m"], color="#4CAF50", linewidth=1.5)
     ax2.set_ylabel("SGP4 vs Numerical divergence (m)", fontsize=11)
-    ax2.set_xlabel("Elapsed time from POE start (hours)", fontsize=11)
+    ax2.set_xlabel("Elapsed time from common IC epoch (hours)", fontsize=11)
     ax2.set_title(
         "Propagator Divergence (SGP4 vs Numerical)",
         fontsize=13, fontweight="bold",
@@ -483,7 +710,7 @@ def plot_summary(result: Dict, plot_dir: Path) -> None:
                  color=CLR_SGP4, linewidth=1.5, label="SGP4")
     ax1.semilogy(hours[mask], result["num_err_3d_m"][mask] / 1000.0,
                  color=CLR_NUM, linewidth=1.5, label="Numerical")
-    ax1.set_xlabel("Elapsed time (hours)", fontsize=11)
+    ax1.set_xlabel("Elapsed time from common IC epoch (hours)", fontsize=11)
     ax1.set_ylabel("3D error vs POE truth (km, log)", fontsize=11)
     ax1.set_title("Error Growth (log scale)", fontsize=12, fontweight="bold")
     ax1.legend(fontsize=10)
@@ -498,7 +725,7 @@ def plot_summary(result: Dict, plot_dir: Path) -> None:
     ax2.semilogy(hours[skip_mask], ratio[skip_mask], color="#4CAF50", linewidth=1.5)
     ax2.axhline(1.0, color="#9E9E9E", linestyle="--", alpha=0.7,
                 label="Parity (ratio = 1)")
-    ax2.set_xlabel("Elapsed time (hours)", fontsize=11)
+    ax2.set_xlabel("Elapsed time from common IC epoch (hours)", fontsize=11)
     ax2.set_ylabel("SGP4 error / Numerical error", fontsize=11)
     ax2.set_title(
         "Numerical Improvement Factor (>1 = numerical wins)",
@@ -523,13 +750,14 @@ def print_summary(result: Dict) -> None:
     print("\n" + "=" * 78)
     print("  SGP4 vs NUMERICAL -- vs POE TRUTH (Sentinel-1A)")
     print("=" * 78)
-    print(f"  POE start:   {result['poe_start'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    print(f"  TLE epoch:   {result['tle_epoch'].strftime('%Y-%m-%d %H:%M:%S UTC')}"
-          f"  (age: {result['tle_age_h']:.1f} h at POE start)")
-    print(f"  Duration:    {result['duration_h']:.1f} h")
+    print(f"  POE start:      {result['poe_start'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"  Common IC:      {result['common_start'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"  TLE epoch:      {result['tle_epoch'].strftime('%Y-%m-%d %H:%M:%S UTC')}"
+          f"  (age at common IC: {result['tle_age_h']:+.1f} h)")
+    print(f"  Duration:       {result['duration_h']:.1f} h")
     print()
-    print(f"  Numerical IC: first POE state (osculating, ITRF -> EME2000)")
-    print(f"  SGP4 IC:      closest TLE (mean elements)")
+    print(f"  Numerical IC: interpolated POE state at common IC epoch (osculating, ITRF -> EME2000)")
+    print(f"  SGP4 IC:      closest TLE by epoch (mean elements)")
     print()
     print(f"  {'Hours':>6}  {'SGP4 err':>12}  {'Num err':>12}  "
           f"{'Ratio':>8}  {'Divergence':>12}")
@@ -610,26 +838,35 @@ def main() -> None:
     # ── Fetch TLEs ───────────────────────────────────────────────────────
     poe_start = poe["utc"][0]
     poe_end = poe["utc"][-1]
+    # Cover the full POE window plus a 1-day buffer on each side so that TLEs
+    # with epochs anywhere inside the POE period are all returned.
     search_start = (poe_start - timedelta(days=1)).strftime("%Y-%m-%d")
-    search_end = (poe_start + timedelta(days=1)).strftime("%Y-%m-%d")
+    search_end = (poe_end + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # ── Space weather ────────────────────────────────────────────────────
+    data_dir = Path(__file__).parent / "data"
+    print("\nLoading space weather ...")
+    sw = fetch_space_weather(data_dir)
 
     print(f"\nFetching TLEs for Sentinel-1A (NORAD {SENTINEL_1A_NORAD}) ...")
     tles = fetch_tles(SENTINEL_1A_NORAD, search_start, search_end)
     print(f"  Found {len(tles)} unique TLEs")
+    best_ep = pick_best_tle(tles, poe_start, poe_end)[0]
     for ep, _, _ in tles:
-        marker = " <-" if ep == pick_best_tle(tles, poe_start)[0] else ""
+        in_window = poe_start <= ep <= poe_end
+        marker = " <- selected" if ep == best_ep else (" [in POE window]" if in_window else "")
         print(f"    {ep.strftime('%Y-%m-%d %H:%M:%S UTC')}{marker}")
 
     if not tles:
         print("No TLEs found. Exiting.")
         sys.exit(1)
 
-    tle_epoch, tle_l1, tle_l2 = pick_best_tle(tles, poe_start)
+    tle_epoch, tle_l1, tle_l2 = pick_best_tle(tles, poe_start, poe_end)
 
     # ── Run comparison ───────────────────────────────────────────────────
     print(f"\nPropagating for up to {args.hours:.0f} h ...")
     result = compare_propagators(
-        poe, tle_l1, tle_l2, tle_epoch,
+        poe, tle_l1, tle_l2, tle_epoch, sw,
         max_hours=args.hours, step_s=args.step,
     )
 

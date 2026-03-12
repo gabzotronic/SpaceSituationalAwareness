@@ -4,11 +4,15 @@ import argparse
 import json
 import logging
 import sqlite3
+import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import spacetrack.operators as op
 from spacetrack import SpaceTrackClient
+
+sys.path.insert(0, str(Path(__file__).parent))
 
 from config import (
     BATCH_SIZE,
@@ -68,11 +72,26 @@ def _coerce(val, col):
 
 
 def init_db():
-    """Create/open DB and apply schema."""
+    """Create/open DB and apply schema, including idempotent OD-column migration."""
     con = sqlite3.connect(str(DB_PATH))
     con.row_factory = sqlite3.Row
     with open(SCHEMA_PATH) as f:
         con.executescript(f.read())
+
+    # Idempotent migration: add Phase-1 OD columns to existing maneuvers tables.
+    # ALTER TABLE fails silently if columns already exist.
+    for col_def in [
+        "CLASSIFICATION  TEXT",
+        "KP              REAL",
+        "VEL_RESIDUAL_MS REAL",
+        "BSTAR_DELTA     REAL",
+    ]:
+        try:
+            con.execute(f"ALTER TABLE maneuvers ADD COLUMN {col_def}")
+            con.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
     return con
 
 
@@ -254,105 +273,59 @@ def ingest_update(con, st):
 
 # ── Maneuver detection ─────────────────────────────────────────
 
-# Map threshold keys to the (gp column, maneuvers delta column) pairs
-_ELEMENT_MAP = [
-    ("SEMIMAJOR_AXIS", "DELTA_SMA"),
-    ("ECCENTRICITY",   "DELTA_ECCENTRICITY"),
-    ("INCLINATION",    "DELTA_INCLINATION"),
-    ("RA_OF_ASC_NODE", "DELTA_RAAN"),
-    ("PERIOD",         "DELTA_PERIOD"),
-]
-
-
 def detect_maneuvers(con, norad_ids):
-    """Compare current GP vs most recent gp_history for each object.
+    """Run OD-based maneuver detection for recently updated objects.
 
-    If any tracked orbital element delta exceeds its threshold, insert a
-    maneuver detection row.  Only examines the given *norad_ids* (i.e. the
-    objects just refreshed by --update).
+    Loads Kp once, then calls analyse_maneuvers() per NORAD ID so that
+    results are persisted to the maneuvers table with CLASSIFICATION,
+    VEL_RESIDUAL_MS, and BSTAR_DELTA populated.
     """
     if not norad_ids:
         return
 
+    from analysis.maneuver_detection import analyse_maneuvers, get_kp_index
+
+    data_dir = Path(__file__).parent / "analysis" / "data"
+
+    # Determine time window from the objects just updated
+    placeholders = ", ".join(["?"] * len(norad_ids))
+    row = con.execute(
+        f"SELECT MIN(EPOCH), MAX(EPOCH) FROM gp_history "
+        f"WHERE NORAD_CAT_ID IN ({placeholders})",
+        list(norad_ids),
+    ).fetchone()
+    window_start = (row[0] or "2020-01-01")[:10]
+    window_end   = (row[1] or datetime.now(timezone.utc).date().isoformat())[:10]
+
+    # Load Kp once for the entire batch
+    try:
+        kp_df = get_kp_index(window_start, window_end, data_dir)
+    except Exception as exc:
+        log.warning("Kp fetch failed (%s) — proceeding without space weather filter", exc)
+        kp_df = None
+
     detected = 0
     for nid in norad_ids:
-        # Current epoch from gp
-        cur = con.execute(
-            "SELECT EPOCH, SEMIMAJOR_AXIS, ECCENTRICITY, INCLINATION, "
-            "RA_OF_ASC_NODE, PERIOD, APOAPSIS, PERIAPSIS "
-            "FROM gp WHERE NORAD_CAT_ID = ?",
-            (nid,),
-        ).fetchone()
-        if cur is None:
-            continue
+        try:
+            result = analyse_maneuvers(
+                norad_id=nid,
+                data_dir=data_dir,
+                con=con,
+                kp_df=kp_df,
+            )
+            if not result.empty:
+                detected += result["likely_maneuver"].sum()
+        except Exception as exc:
+            log.warning("analyse_maneuvers failed for NORAD %d: %s", nid, exc)
 
-        # Most recent prior epoch from gp_history
-        prev = con.execute(
-            "SELECT EPOCH, SEMIMAJOR_AXIS, ECCENTRICITY, INCLINATION, "
-            "RA_OF_ASC_NODE, PERIOD, APOAPSIS, PERIAPSIS "
-            "FROM gp_history WHERE NORAD_CAT_ID = ? ORDER BY EPOCH DESC LIMIT 1",
-            (nid,),
-        ).fetchone()
-        if prev is None:
-            continue
-
-        # Compute deltas; skip if either value is NULL
-        deltas = {}
-        exceeded = False
-        for elem, delta_col in _ELEMENT_MAP:
-            c_val = cur[elem]
-            p_val = prev[elem]
-            if c_val is None or p_val is None:
-                deltas[delta_col] = None
-                continue
-            d = abs(c_val - p_val)
-            deltas[delta_col] = d
-            threshold = MANEUVER_THRESHOLDS.get(elem)
-            if threshold is not None and d > threshold:
-                exceeded = True
-
-        if not exceeded:
-            continue
-
-        # Also record apoapsis/periapsis deltas (informational, not threshold-checked)
-        for gp_col, delta_col in [("APOAPSIS", "DELTA_APOAPSIS"), ("PERIAPSIS", "DELTA_PERIAPSIS")]:
-            c_val = cur[gp_col]
-            p_val = prev[gp_col]
-            if c_val is not None and p_val is not None:
-                deltas[delta_col] = abs(c_val - p_val)
-            else:
-                deltas[delta_col] = None
-
-        con.execute(
-            "INSERT OR IGNORE INTO maneuvers "
-            "(NORAD_CAT_ID, EPOCH_BEFORE, EPOCH_AFTER, DELTA_SMA, "
-            "DELTA_ECCENTRICITY, DELTA_INCLINATION, DELTA_RAAN, "
-            "DELTA_PERIOD, DELTA_APOAPSIS, DELTA_PERIAPSIS) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                nid,
-                prev["EPOCH"],
-                cur["EPOCH"],
-                deltas["DELTA_SMA"],
-                deltas["DELTA_ECCENTRICITY"],
-                deltas["DELTA_INCLINATION"],
-                deltas["DELTA_RAAN"],
-                deltas["DELTA_PERIOD"],
-                deltas["DELTA_APOAPSIS"],
-                deltas["DELTA_PERIAPSIS"],
-            ),
-        )
-        detected += 1
-
-    con.commit()
-    log.info("Detected %d maneuver(s) across %d candidate object(s)", detected, len(norad_ids))
+    log.info("Detected %d maneuver event(s) across %d object(s)", detected, len(norad_ids))
 
 
 def show_maneuvers(con, limit=20):
     """Print recent maneuver detections."""
     rows = con.execute(
         "SELECT m.NORAD_CAT_ID, g.OBJECT_NAME, m.EPOCH_BEFORE, m.EPOCH_AFTER, "
-        "m.DELTA_SMA, m.DELTA_PERIOD, m.DELTA_INCLINATION, m.detected_at "
+        "m.DELTA_SMA, m.DELTA_INCLINATION, m.VEL_RESIDUAL_MS, m.CLASSIFICATION, m.detected_at "
         "FROM maneuvers m "
         "LEFT JOIN gp g ON m.NORAD_CAT_ID = g.NORAD_CAT_ID "
         "ORDER BY m.EPOCH_AFTER DESC LIMIT ?",
@@ -360,21 +333,21 @@ def show_maneuvers(con, limit=20):
     ).fetchall()
 
     total = con.execute("SELECT COUNT(*) FROM maneuvers").fetchone()[0]
-    print(f"\n{'='*70}")
+    print(f"\n{'='*80}")
     print(f"  Maneuver Detections  (showing {len(rows)} of {total})")
-    print(f"{'='*70}")
+    print(f"{'='*80}")
     if not rows:
         print("  No maneuvers detected yet.")
     else:
-        print(f"  {'NORAD':>7}  {'Name':<24} {'Epoch After':<22} {'dSMA km':>8} {'dPer min':>8} {'dInc deg':>8}")
-        print(f"  {'-'*7}  {'-'*24} {'-'*22} {'-'*8} {'-'*8} {'-'*8}")
+        print(f"  {'NORAD':>7}  {'Name':<22} {'Epoch After':<22} {'dSMA km':>8} {'VR m/s':>8} {'Class':<10}")
+        print(f"  {'-'*7}  {'-'*22} {'-'*22} {'-'*8} {'-'*8} {'-'*10}")
         for r in rows:
-            name = (r["OBJECT_NAME"] or "")[:24]
-            dsma = f"{r['DELTA_SMA']:.2f}" if r["DELTA_SMA"] is not None else "N/A"
-            dper = f"{r['DELTA_PERIOD']:.3f}" if r["DELTA_PERIOD"] is not None else "N/A"
-            dinc = f"{r['DELTA_INCLINATION']:.4f}" if r["DELTA_INCLINATION"] is not None else "N/A"
-            print(f"  {r['NORAD_CAT_ID']:>7}  {name:<24} {r['EPOCH_AFTER']:<22} {dsma:>8} {dper:>8} {dinc:>8}")
-    print(f"{'='*70}\n")
+            name  = (r["OBJECT_NAME"] or "")[:22]
+            dsma  = f"{r['DELTA_SMA']:.2f}" if r["DELTA_SMA"] is not None else "N/A"
+            vr    = f"{r['VEL_RESIDUAL_MS']:.2f}" if r["VEL_RESIDUAL_MS"] is not None else "N/A"
+            cls   = r["CLASSIFICATION"] or "legacy"
+            print(f"  {r['NORAD_CAT_ID']:>7}  {name:<22} {r['EPOCH_AFTER']:<22} {dsma:>8} {vr:>8} {cls:<10}")
+    print(f"{'='*80}\n")
 
 
 # ── Historical backfill ─────────────────────────────────────────
@@ -479,12 +452,15 @@ def main():
                        help="Backfill gp_history for one object over a date range")
     group.add_argument("--status", action="store_true", help="Show DB stats")
     group.add_argument("--maneuvers", action="store_true", help="Show recent maneuver detections")
+    _today     = datetime.now(timezone.utc).date()
+    _start_def = (_today - timedelta(days=90)).isoformat()
+    _end_def   = _today.isoformat()
     parser.add_argument("--norad", type=int,
                         help="NORAD_CAT_ID to backfill (required with --backfill)")
-    parser.add_argument("--start", default="2025-12-18",
-                        help="Start date for --backfill (YYYY-MM-DD, default: 2025-12-18)")
-    parser.add_argument("--end", default="2026-03-10",
-                        help="End date for --backfill (YYYY-MM-DD, default: 2026-03-10)")
+    parser.add_argument("--start", default=_start_def,
+                        help=f"Start date for --backfill (YYYY-MM-DD, default: 90 days ago)")
+    parser.add_argument("--end", default=_end_def,
+                        help=f"End date for --backfill (YYYY-MM-DD, default: today)")
     args = parser.parse_args()
 
     con = init_db()
