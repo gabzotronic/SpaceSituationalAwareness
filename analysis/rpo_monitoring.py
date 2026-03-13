@@ -819,6 +819,21 @@ ADRASJ_MISSION = MissionConfig(
     ],
 )
 
+ELSAD_MISSION = MissionConfig(
+    chaser_name  = "ELSA-d Servicer",
+    chaser_norad = 47944,
+    target_name  = "ELSA-d Client",
+    target_norad = 51288,
+    window_start = "2021-03-22",
+    window_end   = "2022-05-31",
+    phases = [
+        ("1 — Commissioning",                "2021-03-22", "2021-08-24"),
+        ("2 — Manual Capture Demo",          "2021-08-25", "2022-01-24"),
+        ("3 — Autonomous Capture & Rendezvous", "2022-01-25", "2022-05-04"),
+        ("4 — Post-rendezvous Monitoring",   "2022-05-05", "2022-05-31"),
+    ],
+)
+
 LDPE3A_SJ23_MISSION = MissionConfig(
     chaser_name  = "LDPE-3A",
     chaser_norad = 55264,
@@ -836,4 +851,4 @@ LDPE3A_SJ23_MISSION = MissionConfig(
 )
 
 if __name__ == "__main__":
-    main(LDPE3A_SJ23_MISSION)
+    main(ADRASJ_MISSION)
