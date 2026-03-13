@@ -95,6 +95,13 @@ def init_db():
     return con
 
 
+def _check_api_error(records, context=""):
+    """Raise if Space-Track returned an error response instead of data."""
+    if records and isinstance(records[0], dict) and "error" in records[0]:
+        msg = records[0]["error"]
+        raise RuntimeError(f"Space-Track API error{' (' + context + ')' if context else ''}: {msg}")
+
+
 def _build_gp_row(rec):
     """Extract a tuple of values from a GP JSON record."""
     vals = []
@@ -146,6 +153,7 @@ def ingest_full(con, st):
         format="json",
     )
     gp_records = json.loads(gp_json) if isinstance(gp_json, str) else gp_json
+    _check_api_error(gp_records, "GP full fetch")
     log.info("Received %d GP records", len(gp_records))
 
     rows = [_build_gp_row(r) for r in gp_records]
@@ -212,6 +220,7 @@ def ingest_update(con, st):
         format="json",
     )
     gp_records = json.loads(gp_json) if isinstance(gp_json, str) else gp_json
+    _check_api_error(gp_records, "GP update fetch")
     log.info("Received %d updated GP records", len(gp_records))
 
     if gp_records:
