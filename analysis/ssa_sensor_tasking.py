@@ -2,10 +2,13 @@
 
 Computes visibility windows for three ground-based SSA sensors over 04–06 Mar 2026,
 then solves a CP-SAT scheduling problem to minimise average fleet revisit time.
-Output: Gantt-style access window plot (selected vs. skipped windows).
+Output: Gantt-style access window plot (selected vs. skipped windows) and
+        optional seekable Plotly HTML animation (--savevid).
 
 Usage:
     conda run -n orbit python analysis/ssa_sensor_tasking.py
+    conda run -n orbit python analysis/ssa_sensor_tasking.py --savevid tasking.html
+    conda run -n orbit python analysis/ssa_sensor_tasking.py --savevid tasking.html --step 300
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from __future__ import annotations
 # =============================================================================
 # Section 1: Imports + sys.path bootstrap
 # =============================================================================
+import bisect
 import sqlite3
 import sys
 from collections import defaultdict
@@ -54,6 +58,11 @@ _T_END   = datetime(2026, 3, 8, 0, 0, 0, tzinfo=timezone.utc)
 
 PASS_STEP_S       = 15    # seconds between samples inside a detected pass
 SOLVER_TIME_LIMIT = 60.0  # seconds
+
+# HTML animation export defaults — override via --step CLI flag
+PROPAGATION_STEP_S = 10       # seconds between groundtrack propagation samples
+HTML_STEP_S        = 60 * 5   # simulated seconds per animation frame (~864 frames over 3 days)
+HTML_TRAIL_S       = 10 * 60  # groundtrack trail length shown on map (10 min)
 
 # =============================================================================
 # Section 3: Sensor dataclass + SENSORS list
@@ -102,6 +111,7 @@ def load_sing_satellites() -> list[dict]:
         WHERE COUNTRY_CODE IN ('SING', 'MALA', 'INDO', 'THAI')
           AND TLE_LINE1 IS NOT NULL AND TLE_LINE2 IS NOT NULL
           AND EPOCH >= '2026-01-01'
+          AND APOAPSIS < 800
     """
     with _connect() as conn:
         rows = conn.execute(sql).fetchall()
@@ -495,7 +505,466 @@ def print_conflict_verification(
 
 
 # =============================================================================
-# Section 6: Output — console summaries + Gantt plot
+# Section 6: Groundtrack propagation + Plotly HTML export
+# =============================================================================
+
+def precompute_groundtracks(
+    satellites: list[dict],
+    t_start_unix: float,
+    t_end_unix: float,
+    step_s: int = PROPAGATION_STEP_S,
+) -> dict[int, dict]:
+    """Propagate all satellites at `step_s`-second steps.
+
+    Returns dict: norad_id -> {lats, lons, times (unix), name}
+    """
+    ts = load.timescale()
+    n_steps  = int((t_end_unix - t_start_unix) / step_s) + 1
+    time_arr = np.linspace(t_start_unix, t_end_unix, n_steps)
+
+    t_sf = ts.from_datetimes(
+        [datetime.fromtimestamp(t, tz=timezone.utc) for t in time_arr]
+    )
+
+    result: dict[int, dict] = {}
+    total = len(satellites)
+    for k, sat in enumerate(satellites):
+        norad_id = sat["NORAD_CAT_ID"]
+        name = (sat["OBJECT_NAME"] or str(norad_id)).strip()
+        if (k + 1) % 5 == 0 or k == 0 or k == total - 1:
+            print(f"  [{k + 1}/{total}] {name}", flush=True)
+        try:
+            sat_sf   = EarthSatellite(sat["TLE_LINE1"].strip(), sat["TLE_LINE2"].strip(), name, ts)
+            subpoint = wgs84.subpoint(sat_sf.at(t_sf))
+            lats     = np.asarray(subpoint.latitude.degrees,  dtype=float)
+            lons     = np.asarray(subpoint.longitude.degrees, dtype=float)
+        except Exception as exc:
+            print(f"  WARNING: propagation failed for {name} ({norad_id}): {exc}")
+            lats = np.full(n_steps, np.nan)
+            lons = np.full(n_steps, np.nan)
+        result[norad_id] = {"lats": lats, "lons": lons, "times": time_arr, "name": name}
+
+    return result
+
+
+def _split_antimeridian(lats: np.ndarray, lons: np.ndarray):
+    """Insert np.nan at antimeridian crossings (|Δlon| > 180°)."""
+    if len(lats) < 2:
+        return lats.copy(), lons.copy()
+    crossings = np.where(np.abs(np.diff(lons)) > 180)[0] + 1
+    if len(crossings) == 0:
+        return lats.copy(), lons.copy()
+    return (
+        np.insert(lats.astype(float), crossings, np.nan),
+        np.insert(lons.astype(float), crossings, np.nan),
+    )
+
+
+def _build_sat_selected_times(
+    intervals: list[tuple],
+    selected: set[int],
+) -> dict[int, list[float]]:
+    """Per-satellite sorted AOS timestamps for selected windows."""
+    out: dict[int, list[float]] = {}
+    for i, (_, norad_id, _, t_aos, _) in enumerate(intervals):
+        if i in selected:
+            out.setdefault(norad_id, []).append(t_aos.timestamp())
+    for v in out.values():
+        v.sort()
+    return out
+
+
+def _staleness_at(
+    norad_id: int,
+    t_now: float,
+    t_start_unix: float,
+    sat_selected_times: dict[int, list[float]],
+) -> float:
+    """Minutes since last confirmed track (or since t_start if never tracked)."""
+    tracks = sat_selected_times.get(norad_id, [])
+    if not tracks:
+        return max(0.0, (t_now - t_start_unix) / 60.0)
+    idx  = bisect.bisect_right(tracks, t_now) - 1
+    last = tracks[idx] if idx >= 0 else t_start_unix
+    return max(0.0, (t_now - last) / 60.0)
+
+
+def _compass_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle bearing from (lat1,lon1) → (lat2,lon2), degrees CW from North."""
+    import math
+    dlon   = math.radians(lon2 - lon1)
+    lat1_r = math.radians(lat1)
+    lat2_r = math.radians(lat2)
+    x = math.sin(dlon) * math.cos(lat2_r)
+    y = math.cos(lat1_r) * math.sin(lat2_r) - math.sin(lat1_r) * math.cos(lat2_r) * math.cos(dlon)
+    return math.degrees(math.atan2(x, y)) % 360
+
+
+def _footprint_circle(
+    lat_c: float, lon_c: float,
+    min_el_deg: float, max_range_km: float,
+    n_pts: int = 90,
+) -> tuple:
+    """Lat/lon arrays for the sensor visibility footprint circle.
+
+    Uses spherical Earth geometry.  Satellite altitude is set to max_range_km and
+    the footprint boundary is the locus of ground points from which a satellite at
+    that altitude is visible at exactly min_el_deg elevation.
+
+    Returns (lats, lons) as plain Python lists, closed (last point = first point).
+    """
+    import math
+    R_E = 6371.0
+    h   = max_range_km
+    E   = math.radians(min_el_deg)
+    r_slant  = -R_E * math.sin(E) + math.sqrt((R_E + h) ** 2 - R_E ** 2 * math.cos(E) ** 2)
+    rho      = math.asin(r_slant * math.cos(E) / (R_E + h))
+    lat_r    = math.radians(lat_c)
+    lon_r    = math.radians(lon_c)
+    lats, lons = [], []
+    for i in range(n_pts + 1):
+        b    = math.radians(i * 360.0 / n_pts)
+        lat2 = math.asin(
+            math.sin(lat_r) * math.cos(rho)
+            + math.cos(lat_r) * math.sin(rho) * math.cos(b)
+        )
+        lon2 = lon_r + math.atan2(
+            math.sin(b) * math.sin(rho) * math.cos(lat_r),
+            math.cos(rho) - math.sin(lat_r) * math.sin(lat2),
+        )
+        lats.append(math.degrees(lat2))
+        lons.append(math.degrees(lon2))
+    return lats, lons
+
+
+def export_plotly_html(
+    groundtracks: dict[int, dict],
+    intervals: list[tuple],
+    selected: set[int],
+    t_start_unix: float,
+    t_end_unix: float,
+    output_path: str,
+    html_step_s: int = HTML_STEP_S,
+) -> None:
+    """Build an animated Plotly figure and write to a self-contained HTML file.
+
+    The HTML file includes:
+      - Equirectangular world map with rolling groundtracks, satellite markers,
+        and colour-coded sensor-to-satellite tracking lines with arrowheads.
+      - Sensor visibility footprint circles.
+      - Per-satellite staleness bar chart below the map.
+      - Play/Pause buttons and a seekable time slider.
+
+    html_step_s controls animation resolution.  Default HTML_STEP_S → ~864 frames
+    for a 3-day window.  Use smaller values (e.g. 60) for smoother animation at
+    the cost of a larger file (~5× per 5× step reduction).
+    Frame display duration auto-scales as max(30, step_s * 80 / 300) ms.
+    """
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        sys.exit("plotly required: conda install -c conda-forge plotly")
+
+    import colorsys
+
+    sat_ids   = sorted(groundtracks.keys())
+    n_sats    = len(sat_ids)
+    sat_names = [groundtracks[nid]["name"][:15] for nid in sat_ids]
+
+    sat_colors = []
+    for k in range(n_sats):
+        r, g, b = colorsys.hsv_to_rgb(k / n_sats * 0.85, 0.9, 0.95)
+        sat_colors.append(f"rgb({int(r*255)},{int(g*255)},{int(b*255)})")
+
+    n_frames       = int((t_end_unix - t_start_unix) / html_step_s) + 1
+    html_time_axis = np.linspace(t_start_unix, t_end_unix, n_frames)
+
+    sat_selected_times = _build_sat_selected_times(intervals, selected)
+
+    selected_by_sat: dict[int, list[tuple]] = {}
+    for i, (sensor_name, norad_id, _, t_aos, t_los) in enumerate(intervals):
+        if i in selected:
+            selected_by_sat.setdefault(norad_id, []).append(
+                (sensor_name, t_aos.timestamp(), t_los.timestamp())
+            )
+
+    sensor_latlon = {s.name: (s.lat_deg, s.lon_deg) for s in SENSORS}
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        row_heights=[0.65, 0.35],
+        specs=[[{"type": "geo"}], [{"type": "xy"}]],
+        vertical_spacing=0.06,
+        subplot_titles=["Ground Tracks & Sensor Coverage", "Satellite Staleness"],
+    )
+
+    n_sens = len(SENSORS)
+
+    # Trace layout (order matters — must match frame update indices):
+    #   0              : sensor markers (fixed)
+    #   1..n_sens       : sensor footprint circles (fixed)
+    #   n_sens+1..n_sens+N     : groundtrack trails
+    #   n_sens+N+1..n_sens+2N  : satellite position markers
+    #   n_sens+2N+1..n_sens+3N : sensor→satellite tracking lines (with arrow)
+    #   n_sens+3N+1            : staleness bars
+
+    fig.add_trace(go.Scattergeo(
+        lat=[s.lat_deg for s in SENSORS],
+        lon=[s.lon_deg for s in SENSORS],
+        mode="markers+text",
+        marker=dict(
+            symbol="triangle-up", size=14,
+            color=[SENSOR_COLORS.get(s.name, "white") for s in SENSORS],
+            line=dict(width=1, color="white"),
+        ),
+        text=[s.name for s in SENSORS],
+        textposition="top right",
+        textfont=dict(size=9, color="white"),
+        name="Sensors",
+        hovertemplate="%{text}<extra></extra>",
+    ), row=1, col=1)
+
+    for sensor in SENSORS:
+        fp_lats, fp_lons = _footprint_circle(
+            sensor.lat_deg, sensor.lon_deg,
+            sensor.min_el_deg, sensor.max_range_km,
+        )
+        color = SENSOR_COLORS.get(sensor.name, "white")
+        fig.add_trace(go.Scattergeo(
+            lat=fp_lats, lon=fp_lons,
+            mode="lines",
+            fill="toself",
+            fillcolor="rgba(180,180,180,0.10)",
+            line=dict(color=color, width=1.0, dash="dot"),
+            name=f"{sensor.name} coverage",
+            showlegend=False,
+            hovertemplate=(
+                f"{sensor.name} coverage<br>"
+                f"min el {sensor.min_el_deg}°, range {sensor.max_range_km:.0f} km"
+                "<extra></extra>"
+            ),
+        ), row=1, col=1)
+
+    for k, nid in enumerate(sat_ids):
+        fig.add_trace(go.Scattergeo(
+            lat=[], lon=[],
+            mode="lines",
+            line=dict(color=sat_colors[k], width=1.2),
+            name=groundtracks[nid]["name"],
+            showlegend=False,
+            hoverinfo="skip",
+        ), row=1, col=1)
+
+    for k, nid in enumerate(sat_ids):
+        fig.add_trace(go.Scattergeo(
+            lat=[], lon=[],
+            mode="markers",
+            marker=dict(size=9, color=sat_colors[k], line=dict(width=0.8, color="white")),
+            name=groundtracks[nid]["name"],
+            hovertemplate=f"<b>{groundtracks[nid]['name']}</b><br>"
+                          "%{lat:.2f}°N, %{lon:.2f}°E<extra></extra>",
+        ), row=1, col=1)
+
+    for k, nid in enumerate(sat_ids):
+        fig.add_trace(go.Scattergeo(
+            lat=[], lon=[],
+            mode="lines+markers",
+            line=dict(color="white", width=2.0),
+            marker=dict(symbol=["circle", "arrow"], size=[0, 14],
+                        color="white", angle=[0, 0]),
+            showlegend=False,
+            hoverinfo="skip",
+        ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=sat_names,
+        y=np.zeros(n_sats),
+        marker=dict(
+            color=np.zeros(n_sats),
+            colorscale=[[0, "#00bb55"], [0.417, "#ffaa00"], [1, "#dd2222"]],
+            cmin=0, cmax=120,
+            showscale=False,
+            line=dict(color="#334466", width=0.5),
+        ),
+        showlegend=False,
+        hovertemplate="%{x}: %{y:.0f} min<extra></extra>",
+    ), row=2, col=1)
+
+    # Pre-compute fixed staleness y-axis max
+    max_stale_min = 0.0
+    for nid in sat_ids:
+        tracks   = sat_selected_times.get(nid, [])
+        timeline = [t_start_unix] + tracks + [t_end_unix]
+        for j in range(len(timeline) - 1):
+            max_stale_min = max(max_stale_min, (timeline[j + 1] - timeline[j]) / 60.0)
+    y_max = (int(max_stale_min / 30) + 1) * 30.0
+
+    frame_ms = max(30, int(html_step_s * 80 / 300))
+
+    print(f"  Building {n_frames} frames at {html_step_s}s step ({frame_ms}ms/frame)…", flush=True)
+    frames       = []
+    slider_steps = []
+
+    _off        = 1 + n_sens
+    _trail_idx  = list(range(_off,            _off + n_sats))
+    _marker_idx = list(range(_off + n_sats,   _off + 2*n_sats))
+    _tline_idx  = list(range(_off + 2*n_sats, _off + 3*n_sats))
+    _bar_idx    = [_off + 3*n_sats]
+    UPDATE_IDX  = _trail_idx + _marker_idx + _tline_idx + _bar_idx
+
+    for fi, t_now in enumerate(html_time_axis):
+        if fi % 100 == 0 or fi == n_frames - 1:
+            print(f"\r  Frame {fi + 1}/{n_frames}", end="", flush=True)
+
+        t_trail_start = t_now - HTML_TRAIL_S
+        dt_now        = datetime.fromtimestamp(t_now, tz=timezone.utc)
+        time_str      = dt_now.strftime("%Y-%m-%d %H:%M UTC")
+
+        trail_data  = []
+        marker_data = []
+        tline_data  = []
+        stale_vals  = []
+
+        for k, nid in enumerate(sat_ids):
+            gt    = groundtracks[nid]
+            times = gt["times"]
+            lats  = gt["lats"]
+            lons  = gt["lons"]
+
+            mask   = (times >= t_trail_start) & (times <= t_now)
+            t_lats = lats[mask]
+            t_lons = lons[mask]
+            if len(t_lats) > 1:
+                sl, slo = _split_antimeridian(t_lats, t_lons)
+                trl_lat = [None if np.isnan(v) else float(v) for v in sl]
+                trl_lon = [None if np.isnan(v) else float(v) for v in slo]
+            else:
+                trl_lat, trl_lon = [], []
+            trail_data.append(go.Scattergeo(lat=trl_lat, lon=trl_lon))
+
+            idx_now = max(0, min(int(np.searchsorted(times, t_now, side="right")) - 1,
+                                 len(times) - 1))
+            cur_lat = lats[idx_now]
+            cur_lon = lons[idx_now]
+            if np.isfinite(cur_lat) and np.isfinite(cur_lon):
+                marker_data.append(go.Scattergeo(lat=[float(cur_lat)], lon=[float(cur_lon)]))
+            else:
+                marker_data.append(go.Scattergeo(lat=[], lon=[]))
+
+            active = False
+            for sensor_name, t_aos, t_los in selected_by_sat.get(nid, []):
+                if t_aos <= t_now <= t_los and np.isfinite(cur_lat):
+                    s_lat, s_lon = sensor_latlon[sensor_name]
+                    color = SENSOR_COLORS.get(sensor_name, "white")
+                    brg   = _compass_bearing(s_lat, s_lon, float(cur_lat), float(cur_lon))
+                    tline_data.append(go.Scattergeo(
+                        lat=[s_lat, float(cur_lat)],
+                        lon=[s_lon, float(cur_lon)],
+                        line=dict(color=color, width=2.0),
+                        marker=dict(
+                            symbol=["circle", "arrow"],
+                            size=[0, 14],
+                            color=[color, color],
+                            angle=[0, -brg],
+                        ),
+                    ))
+                    active = True
+                    break
+            if not active:
+                tline_data.append(go.Scattergeo(lat=[], lon=[]))
+
+            stale_vals.append(_staleness_at(nid, t_now, t_start_unix, sat_selected_times))
+
+        bar_data = [go.Bar(y=stale_vals, marker=dict(color=stale_vals))]
+
+        frames.append(go.Frame(
+            data=trail_data + marker_data + tline_data + bar_data,
+            traces=UPDATE_IDX,
+            name=str(fi),
+            layout=go.Layout(title_text=f"SSA Sensor Tasking  —  {time_str}"),
+        ))
+        slider_steps.append({
+            "args": [[str(fi)], {"frame": {"duration": 0, "redraw": True},
+                                  "mode": "immediate", "transition": {"duration": 0}}],
+            "label": dt_now.strftime("%d%b %H:%M"),
+            "method": "animate",
+        })
+
+    print()
+    fig.frames = frames
+
+    t0_str = datetime.fromtimestamp(t_start_unix, tz=timezone.utc).strftime("%d %b")
+    t1_str = datetime.fromtimestamp(t_end_unix,   tz=timezone.utc).strftime("%d %b %Y")
+
+    fig.update_layout(
+        title=dict(text=f"SSA Sensor Tasking  —  {t0_str} – {t1_str}",
+                   font=dict(color="white", size=14)),
+        paper_bgcolor="#1a1a2e",
+        plot_bgcolor="#1e1e30",
+        font=dict(color="white"),
+        height=920,
+        legend=dict(bgcolor="#1e1e30", bordercolor="#446688", borderwidth=1,
+                    font=dict(size=9)),
+        geo=dict(
+            showland=True,      landcolor="#2d2d44",
+            showocean=True,     oceancolor="#1a2a3a",
+            showcoastlines=True, coastlinecolor="#7799bb", coastlinewidth=0.6,
+            showcountries=True, countrycolor="#557799",
+            showframe=False,
+            projection_type="equirectangular",
+            bgcolor="#1a2a3a",
+            lataxis=dict(showgrid=False),
+            lonaxis=dict(showgrid=False),
+        ),
+        xaxis=dict(tickfont=dict(size=8), tickangle=40),
+        yaxis=dict(title="Time since last track (min)", range=[0, y_max],
+                   gridcolor="#2a3a4a"),
+        updatemenus=[dict(
+            type="buttons",
+            buttons=[
+                dict(label="Play",
+                     method="animate",
+                     args=[None, {"frame": {"duration": frame_ms, "redraw": True},
+                                  "fromcurrent": True,
+                                  "transition": {"duration": 0}}]),
+                dict(label="Pause",
+                     method="animate",
+                     args=[[None], {"frame": {"duration": 0, "redraw": False},
+                                    "mode": "immediate",
+                                    "transition": {"duration": 0}}]),
+            ],
+            direction="left",
+            pad={"r": 10, "t": 10},
+            showactive=False,
+            x=0.12, xanchor="right",
+            y=1.04, yanchor="top",
+            bgcolor="#2a2a3e",
+            font=dict(color="white"),
+            bordercolor="#446688",
+        )],
+        sliders=[dict(
+            active=0,
+            steps=slider_steps,
+            currentvalue=dict(font=dict(size=11, color="white"),
+                              prefix="UTC: ", visible=True, xanchor="center"),
+            transition=dict(duration=0),
+            pad=dict(b=10, t=10),
+            len=0.88, x=0.06, y=0,
+            bgcolor="#2a2a3e",
+            font=dict(color="white"),
+            bordercolor="#446688",
+        )],
+    )
+
+    out = Path(output_path)
+    print(f"  Writing HTML…", flush=True)
+    fig.write_html(str(out), include_plotlyjs="cdn")
+    print(f"  Saved: {out.resolve()}  ({out.stat().st_size / 1e6:.1f} MB)")
+
+
+# =============================================================================
+# Section 7: Output — console summaries + Gantt plot
 # =============================================================================
 
 def _print_access_summary(
@@ -753,10 +1222,36 @@ def plot_revisit_time(
 
 
 # =============================================================================
-# Section 7: main()
+# Section 8: main()
 # =============================================================================
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="SSA Sensor Tasking Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  # Default: access windows + Gantt + revisit-time plots\n"
+            "  conda run -n orbit python analysis/ssa_sensor_tasking.py\n\n"
+            "  # Also save a seekable Plotly HTML animation\n"
+            "  conda run -n orbit python analysis/ssa_sensor_tasking.py --savevid tasking.html\n\n"
+            "  # Coarser animation step (smaller file, jumpier playback)\n"
+            "  conda run -n orbit python analysis/ssa_sensor_tasking.py --savevid tasking.html --step 300\n"
+        ),
+    )
+    parser.add_argument(
+        "--savevid", metavar="OUTPUT.html",
+        help="Export a self-contained Plotly HTML animation in addition to the static plots.",
+    )
+    parser.add_argument(
+        "--step", type=int, default=HTML_STEP_S,
+        help=f"Animation time step in seconds for --savevid (default: {HTML_STEP_S}). "
+              "Smaller values give smoother animation but a larger file.",
+    )
+    args = parser.parse_args()
+
     print("Loading SEA satellites from DB...")
     satellites = load_sing_satellites()
 
@@ -787,6 +1282,20 @@ def main() -> None:
 
     if status != "SKIPPED":
         plot_revisit_time(intervals, selected, _T_START, _T_END)
+
+    if args.savevid:
+        t_start_unix = _T_START.timestamp()
+        t_end_unix   = _T_END.timestamp()
+        print(f"\nPre-computing groundtracks at {PROPAGATION_STEP_S}s resolution...")
+        groundtracks = precompute_groundtracks(satellites, t_start_unix, t_end_unix)
+        print("  Done.")
+        print(f"\nExporting Plotly HTML ({args.step}s step)…")
+        export_plotly_html(
+            groundtracks, intervals, selected,
+            t_start_unix, t_end_unix,
+            output_path=args.savevid,
+            html_step_s=args.step,
+        )
 
 
 if __name__ == "__main__":
