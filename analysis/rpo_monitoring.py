@@ -850,5 +850,17 @@ LDPE3A_SJ23_MISSION = MissionConfig(
     ],
 )
 
+SBSS_MISSION = MissionConfig(
+    chaser_name  = "SBSS (USA 216)",
+    chaser_norad = 37168,
+    target_name  = "STARLINK-4617",
+    target_norad = 53675,
+    window_start = "2024-03-29",
+    window_end   = "2024-08-23",
+    phases = [
+        
+    ],
+)
+
 if __name__ == "__main__":
-    main(ADRASJ_MISSION)
+    main(SBSS_MISSION)

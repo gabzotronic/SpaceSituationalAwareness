@@ -197,7 +197,7 @@ def ingest_full(con, st):
 
 # ── Incremental update ──────────────────────────────────────────
 
-def ingest_update(con, st):
+def ingest_update(con, st, detect=False):
     """Incremental update: fetch GP records newer than last sync, refresh SATCAT."""
     t0 = time.time()
 
@@ -249,8 +249,8 @@ def ingest_update(con, st):
         con.commit()
         log.info("Inserted %d updated GP records", len(rows))
 
-        # Run maneuver detection on the objects just updated
-        detect_maneuvers(con, norad_ids)
+        if detect:
+            detect_maneuvers(con, norad_ids)
 
     # Update GP sync timestamp
     now = datetime.now(timezone.utc).isoformat()
@@ -259,8 +259,16 @@ def ingest_update(con, st):
         ("last_gp_sync", now),
     )
 
-    # Refresh SATCAT (full replace — lightweight, metadata changes rarely)
-    log.info("Refreshing SATCAT …")
+    elapsed = time.time() - t0
+    log.info("Incremental update completed in %.1f s", elapsed)
+
+
+# ── SATCAT update ───────────────────────────────────────────────
+
+def ingest_update_satcat(con, st):
+    """Full replace of SATCAT metadata."""
+    t0 = time.time()
+    log.info("Fetching full SATCAT from Space-Track …")
     sat_json = st.satcat(orderby="norad_cat_id", format="json")
     sat_records = json.loads(sat_json) if isinstance(sat_json, str) else sat_json
     rows = [_build_satcat_row(r) for r in sat_records]
@@ -269,15 +277,13 @@ def ingest_update(con, st):
         con.executemany(sql, rows[i : i + BATCH_SIZE])
     con.commit()
     log.info("Refreshed %d SATCAT records", len(rows))
-
+    now = datetime.now(timezone.utc).isoformat()
     con.execute(
         "INSERT OR REPLACE INTO sync_meta (key, value) VALUES (?, ?)",
         ("last_satcat_sync", now),
     )
     con.commit()
-
-    elapsed = time.time() - t0
-    log.info("Incremental update completed in %.1f s", elapsed)
+    log.info("SATCAT update completed in %.1f s", time.time() - t0)
 
 
 # ── Maneuver detection ─────────────────────────────────────────
@@ -456,11 +462,14 @@ def main():
     parser = argparse.ArgumentParser(description="Space-Track catalog ingestion")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--full", action="store_true", help="Full initial load")
-    group.add_argument("--update", action="store_true", help="Incremental update since last sync")
+    group.add_argument("--update", action="store_true", help="Incremental GP update since last sync")
+    group.add_argument("--update-satcat", action="store_true", help="Full SATCAT metadata refresh")
     group.add_argument("--backfill", action="store_true",
                        help="Backfill gp_history for one object over a date range")
     group.add_argument("--status", action="store_true", help="Show DB stats")
     group.add_argument("--maneuvers", action="store_true", help="Show recent maneuver detections")
+    parser.add_argument("--detect-maneuvers", action="store_true",
+                        help="Run maneuver detection after --update (opt-in)")
     _today     = datetime.now(timezone.utc).date()
     _start_def = (_today - timedelta(days=90)).isoformat()
     _end_def   = _today.isoformat()
@@ -490,7 +499,9 @@ def main():
     if args.full:
         ingest_full(con, st)
     elif args.update:
-        ingest_update(con, st)
+        ingest_update(con, st, detect=args.detect_maneuvers)
+    elif args.update_satcat:
+        ingest_update_satcat(con, st)
     elif args.backfill:
         if not args.norad:
             parser.error("--backfill requires --norad NORAD_ID")

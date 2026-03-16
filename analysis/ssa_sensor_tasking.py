@@ -60,7 +60,7 @@ PASS_STEP_S       = 15    # seconds between samples inside a detected pass
 SOLVER_TIME_LIMIT = 60.0  # seconds
 
 # HTML animation export defaults — override via --step CLI flag
-PROPAGATION_STEP_S = 10       # seconds between groundtrack propagation samples
+PROPAGATION_STEP_S = 30       # seconds between groundtrack propagation samples
 HTML_STEP_S        = 60 * 5   # simulated seconds per animation frame (~864 frames over 3 days)
 HTML_TRAIL_S       = 10 * 60  # groundtrack trail length shown on map (10 min)
 
@@ -112,6 +112,7 @@ def load_sing_satellites() -> list[dict]:
           AND TLE_LINE1 IS NOT NULL AND TLE_LINE2 IS NOT NULL
           AND EPOCH >= '2026-01-01'
           AND APOAPSIS < 800
+          AND OBJECT_NAME NOT IN ('SATORO-T2', 'SATORO-T3')
     """
     with _connect() as conn:
         rows = conn.execute(sql).fetchall()
@@ -783,24 +784,24 @@ def export_plotly_html(
         marker=dict(
             color=np.zeros(n_sats),
             colorscale=[[0, "#00bb55"], [0.417, "#ffaa00"], [1, "#dd2222"]],
-            cmin=0, cmax=120,
+            cmin=0, cmax=2,
             showscale=False,
             line=dict(color="#334466", width=0.5),
         ),
         showlegend=False,
-        hovertemplate="%{x}: %{y:.0f} min<extra></extra>",
+        hovertemplate="%{x}: %{y:.2f} hr<extra></extra>",
     ), row=2, col=1)
 
-    # Pre-compute fixed staleness y-axis max
-    max_stale_min = 0.0
+    # Pre-compute fixed staleness y-axis max (hours)
+    max_stale_hr = 0.0
     for nid in sat_ids:
         tracks   = sat_selected_times.get(nid, [])
         timeline = [t_start_unix] + tracks + [t_end_unix]
         for j in range(len(timeline) - 1):
-            max_stale_min = max(max_stale_min, (timeline[j + 1] - timeline[j]) / 60.0)
-    y_max = (int(max_stale_min / 30) + 1) * 30.0
+            max_stale_hr = max(max_stale_hr, (timeline[j + 1] - timeline[j]) / 3600.0)
+    y_max = (int(max_stale_hr / 0.5) + 1) * 0.5  # round up to next 0.5-hr tick
 
-    frame_ms = max(30, int(html_step_s * 80 / 300))
+    frame_ms = min(15, int(html_step_s * 80 / 300))
 
     print(f"  Building {n_frames} frames at {html_step_s}s step ({frame_ms}ms/frame)…", flush=True)
     frames       = []
@@ -874,7 +875,7 @@ def export_plotly_html(
             if not active:
                 tline_data.append(go.Scattergeo(lat=[], lon=[]))
 
-            stale_vals.append(_staleness_at(nid, t_now, t_start_unix, sat_selected_times))
+            stale_vals.append(_staleness_at(nid, t_now, t_start_unix, sat_selected_times) / 60.0)
 
         bar_data = [go.Bar(y=stale_vals, marker=dict(color=stale_vals))]
 
@@ -918,7 +919,7 @@ def export_plotly_html(
             lonaxis=dict(showgrid=False),
         ),
         xaxis=dict(tickfont=dict(size=8), tickangle=40),
-        yaxis=dict(title="Time since last track (min)", range=[0, y_max],
+        yaxis=dict(title="Time since last track (hr)", range=[0, y_max],
                    gridcolor="#2a3a4a"),
         updatemenus=[dict(
             type="buttons",
@@ -1130,6 +1131,9 @@ def plot_gantt(
         ax.legend(loc="upper right", fontsize=9)
 
     plt.tight_layout()
+    _out = _repo_root / "plots" / "ssa_tasking_gantt.png"
+    fig.savefig(_out, dpi=150, bbox_inches="tight")
+    print(f"  Saved: {_out}")
     plt.show()
 
 def plot_revisit_time(
@@ -1218,6 +1222,9 @@ def plot_revisit_time(
     ax.legend(fontsize=9)
 
     plt.tight_layout()
+    _out = _repo_root / "plots" / "ssa_tasking_revisit.png"
+    fig.savefig(_out, dpi=150, bbox_inches="tight")
+    print(f"  Saved: {_out}")
     plt.show()
 
 
